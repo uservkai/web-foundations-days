@@ -41,7 +41,12 @@ noteText.addEventListener("input", () => {
 });
 
 noteText.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") clearNote();
+  if (e.key === "Escape") {
+    if (noteText.value.length > 50 && !window.confirm("Clear this note? This cannot be undone.")) {
+      return;
+    }
+    clearNote();
+  }
 });
 
 clearBtn.addEventListener("click", clearNote);
