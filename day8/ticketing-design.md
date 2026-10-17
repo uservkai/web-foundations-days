@@ -223,7 +223,8 @@ In words: a user has many orders and many holds. An event has many seats. An ord
 | order_id | BIGINT FK → orders.id | |
 | provider_payment_id | TEXT NOT NULL **UNIQUE** | the provider's id; lets a webhook find its payment and stops duplicates |
 | amount_cents | INT | |
-| status | TEXT | `pending`, `succeeded`, `failed`, `expired`, `needs_refund`, `refunded` |
+| status | TEXT | `pending`, `succeeded`, `failed`, `expired`, `needs_refund`, `refunding`, `refunded` (allowed transitions in section 5, Step C) |
+| refund_attempts | INT DEFAULT 0 | counts refund tries, used for alerting |
 | deadline_at | TIMESTAMPTZ NOT NULL | the moment our seat reservation for this payment ends (also sent to the provider as its own expiry) |
 | created_at, updated_at | TIMESTAMPTZ | index on (status, deadline_at) for the reconciliation worker |
 
@@ -315,22 +316,88 @@ The same deadline is sent to the provider as its own expiry, so the provider nor
    --         payments 'needs_refund'; orders 'refund_pending'; COMMIT; enqueue a refund job.
 ```
 
-So a late payment is treated fairly: if the seat is still free, the customer who paid gets it (no one was harmed). If another user got it in the meantime, the customer is refunded automatically and emailed, and `tickets.seat_id UNIQUE` guarantees that no second ticket can ever exist for that seat.
+(This logic lives in one function, `apply_provider_result(payment_id, provider_status)`, which the webhook handler **and** the reconciliation worker both call; see Step C.) So a late payment is treated fairly: if the seat is still free, the customer who paid gets it (no one was harmed). If another user got it in the meantime, the customer is refunded automatically and emailed, and `tickets.seat_id UNIQUE` guarantees that no second ticket can ever exist for that seat.
 
-**Step C: Reconciliation worker (webhooks can be lost or delayed).** A background worker runs every minute:
+**Step C: One state machine, one lock, one lock order.** The webhook handler, the reconciliation worker and the refund dispatcher can all touch the same payment at the same moment. To stop them competing, every change to a payment follows the same three rules.
+
+1. **Lock first.** Every path starts with `SELECT ... FROM payments WHERE id = :id FOR UPDATE` (the row lock on the payment), and only then locks seats, in ascending seat id. Using the same order everywhere prevents deadlocks, and only one process at a time can work on a given payment.
+2. **Re-check under the lock.** Whatever a process read earlier is considered stale. After taking the lock it re-reads `status` and acts only if the status is one it is allowed to move on from.
+3. **Compare-and-set.** Each change is `UPDATE payments SET status = :new WHERE id = :id AND status = :expected`. If 0 rows change, someone else already moved it, so the process does nothing and commits.
+
+Allowed transitions (anything not listed is rejected):
+
+| From | To | Who and when |
+| --- | --- | --- |
+| `pending` | `succeeded` | webhook or worker: provider says paid **and** the seats were claimed |
+| `pending` | `needs_refund` | webhook or worker: provider says paid **but** the seats were taken |
+| `pending` | `failed` / `expired` | webhook or worker: provider says failed, cancelled or expired |
+| `expired` | `succeeded` / `needs_refund` | a late "paid" webhook after the worker had already marked it `expired` (same claim-or-refund rule as above) |
+| `needs_refund` | `refunding` | refund dispatcher, which claims the job |
+| `refunding` | `refunded` | refund dispatcher, after the provider confirms |
+| `refunding` | `needs_refund` | recovery of a crashed dispatcher (Step E) |
+
+`succeeded`, `failed` and `refunded` are final. The key point: **a ticket can only be issued from `pending` or `expired`, and a refund can only start from `needs_refund`.** Since `needs_refund` is only ever set in the same locked transaction that decides the seats are gone, one payment can never be both fulfilled and refunded. If a duplicate or late webhook arrives for a payment already in `needs_refund`, `refunding`, `refunded` or `succeeded`, it finds a non-allowed transition and returns `200` without doing anything.
+
+**Step D: Reconciliation worker (webhooks can be lost or delayed).** The worker never decides on its own that a payment failed; it asks the provider and then applies the same function as the webhook. It runs every minute. The provider call is made *outside* any database transaction, because holding a lock during a network call would block everyone else.
 
 ```text
-- Find payments WHERE status = 'pending' AND deadline_at < now() - 2 minutes
-  → ask the provider for the real status (API call, outside any DB transaction),
-    then apply the same handler logic from Step B as if a webhook had arrived.
-  → if the provider says "expired/cancelled": payment 'expired', order 'failed', release seats.
-- Find payments WHERE status = 'needs_refund'
-  → call the provider's refund API with the idempotency key "refund-<payment id>",
-    set payment 'refunded' and order 'refunded' on success, retry with backoff on failure.
-- Alert (page a human) for any payment 'pending' for over 30 minutes or 'needs_refund' for over 1 hour.
+1. Find candidates (no lock held):
+   SELECT id, provider_payment_id FROM payments
+   WHERE  status = 'pending' AND deadline_at < now() - interval '2 minutes'
+   ORDER  BY deadline_at LIMIT 50;
+
+2. For each candidate, ask the provider for the real status (no lock held).
+
+3. Apply the result in a short transaction:
+   BEGIN;
+   SELECT id, status FROM payments WHERE id = :id FOR UPDATE SKIP LOCKED;
+   -- 0 rows returned → a webhook is processing this payment right now → skip it,
+   --   the next run will look again if it is still pending.
+   -- status is no longer 'pending' → the webhook already handled it → COMMIT, skip.
+   -- otherwise: call apply_provider_result(:id, :provider_status), which does
+   --   "paid"                → try to claim seats → 'succeeded', or 'needs_refund'
+   --   "failed/cancelled"    → 'expired', order 'failed', release seats
+   --   "still processing"    → leave 'pending' (no change)
+   COMMIT;
 ```
 
-**Step D: Make the expiry sweeper payment-aware.** It releases only seats whose hold has expired *and* whose payment (if any) is not `pending`:
+`SKIP LOCKED` is what stops the worker from waiting behind (or racing with) a webhook: if the webhook holds the row lock, the worker simply moves on. If the *worker* gets the lock first, a webhook arriving at that moment waits for the short transaction to finish, then re-checks the status under its own lock (rule 2) and either applies a valid transition (for example `expired` → `succeeded` for a late "paid" event) or ignores it. Neither side can act on stale information.
+
+**Step E: Refund dispatcher.** It claims refund jobs in a short transaction, calls the provider outside any transaction, and then records the result. Several dispatcher instances can run at once without double-refunding.
+
+```sql
+-- 1. Claim (short transaction)
+BEGIN;
+WITH picked AS (
+  SELECT id FROM payments
+  WHERE  status = 'needs_refund'
+  ORDER  BY updated_at
+  LIMIT  20
+  FOR UPDATE SKIP LOCKED                     -- other dispatchers and webhooks skip rows we hold
+)
+UPDATE payments p
+SET    status = 'refunding', refund_attempts = refund_attempts + 1, updated_at = now()
+FROM   picked
+WHERE  p.id = picked.id AND p.status = 'needs_refund'      -- compare-and-set
+RETURNING p.id, p.provider_payment_id, p.amount_cents;
+COMMIT;
+
+-- 2. For each returned row, call the provider's refund API (no lock held), with the
+--    idempotency key 'refund-<payment id>'. Even if this call is repeated, the provider refunds once.
+
+-- 3. Record the result
+BEGIN;
+UPDATE payments SET status = 'refunded', updated_at = now()
+WHERE  id = :id AND status = 'refunding';                  -- compare-and-set
+UPDATE orders  SET status = 'refunded'
+WHERE  id = :order_id AND status = 'refund_pending';
+COMMIT;                                                    -- then enqueue the "you were refunded" email
+```
+
+- **If the refund call fails:** the row stays `refunding`. A recovery query moves rows stuck in `refunding` for more than 5 minutes back to `needs_refund` (`UPDATE payments SET status = 'needs_refund' WHERE status = 'refunding' AND updated_at < now() - interval '5 minutes'`). Retrying is safe because of the provider idempotency key.
+- **Alerts:** page a human if any payment is `pending` for over 30 minutes, `needs_refund` or `refunding` for over 1 hour, or `refund_attempts` exceeds 5.
+
+**Step F: Make the expiry sweeper payment-aware.** It releases only seats whose hold has expired *and* whose payment (if any) is not `pending`:
 
 ```sql
 UPDATE seats s SET status = 'available', hold_id = NULL, hold_expires_at = NULL
@@ -347,8 +414,12 @@ WHERE  s.status = 'held' AND s.hold_expires_at < now()
 | Webhook delivered twice | Second delivery ignored (`webhook_events` primary key). |
 | Payment confirmed late, seat still free | Ticket issued, since the seat is still ours or unclaimed. |
 | Payment confirmed late, seat taken by someone else | Automatic refund and email; no double-booking. |
-| Webhook never arrives | Worker asks the provider and applies the same logic. |
-| Refund call fails | Retried with the same idempotency key; alert if stuck. |
+| Webhook never arrives | Worker asks the provider and applies the same logic (Step D). |
+| Webhook and worker handle the same payment at the same instant | Row lock + `SKIP LOCKED` + re-check under lock: one acts, the other skips or no-ops. |
+| Worker marked it `expired`, then a "paid" webhook arrives | Allowed `expired` → `succeeded` or `needs_refund` transition; the customer is never left charged with nothing. |
+| Webhook arrives while a refund is `refunding` or `refunded` | Not an allowed transition; ignored with `200`. A payment is never both fulfilled and refunded. |
+| Two refund dispatchers run at once | `FOR UPDATE SKIP LOCKED` plus compare-and-set claim; provider idempotency key stops duplicates anyway. |
+| Refund call fails or dispatcher crashes | Stuck `refunding` rows return to `needs_refund` after 5 minutes and are retried with the same idempotency key; alert if stuck. |
 
 ### Supporting measures
 
@@ -411,7 +482,7 @@ WHERE  s.status = 'held' AND s.hold_expires_at < now()
 | **PostgreSQL primary** | The single source of truth for seats, holds, orders and tickets. All writes and all seat-ownership decisions happen here, which is what makes the double-booking protection in section 5 work. |
 | **Read replicas** | Copies of the database used for browsing and search queries, so reads never compete with the hold and purchase transactions. |
 | **Message queue + workers** | Handle slow, non-urgent work off the main path: releasing expired holds, sending confirmation emails, and retrying failed jobs. The buyer does not wait for the email. |
-| **Payment reconciliation worker** | Runs every minute. Finds payments still `pending` past their deadline and asks the provider for the true status, applies the same safe finalize-or-refund logic as the webhook handler, and processes the refund queue. Without it, a lost webhook would leave a customer's money taken and no ticket issued (see section 5, Layer 4). |
+| **Payment reconciliation worker** | Runs every minute. Finds payments still `pending` past their deadline and asks the provider for the true status, applies the same locked `apply_provider_result` logic as the webhook handler (so the two can never conflict), and runs the refund dispatcher. Without it, a lost webhook would leave a customer's money taken and no ticket issued (see section 5, Layer 4). |
 | **Payment provider** | External service that handles card details. It notifies us through a signed webhook, and we also accept the synchronous result. This keeps card data away from our servers. |
 
 ### How it survives the big sale
