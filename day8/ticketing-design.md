@@ -76,7 +76,8 @@ All endpoints use HTTPS and JSON. Endpoints marked 🔒 require a login token.
 | 5 | 🔒 `POST /events/{event_id}/holds` | Hold seats. |
 | 6 | 🔒 `DELETE /holds/{hold_id}` | Release a hold early. |
 | 7 | 🔒 `POST /orders` | Create an order from a hold. |
-| 8 | 🔒 `POST /orders/{order_id}/payment` | Pay for an order. |
+| 8 | 🔒 `POST /orders/{order_id}/payment` | Start payment. Returns `202 Accepted` ("processing") because the provider may take a while; returns `410 Gone` if the hold has already expired. |
+| 8b | 🔒 `GET /orders/{order_id}` | Check order status (`pending_payment`, `paid`, `refund_pending`, ...). The page polls this until the result is final. |
 | 9 | 🔒 `GET /me/tickets` | View my tickets. |
 | 10 | `POST /payments/webhook` | Payment provider confirms the result (signature checked). |
 | 11 | `POST /auth/register`, `POST /auth/login` | Create account and log in. |
@@ -198,7 +199,7 @@ In words: a user has many orders and many holds. An event has many seats. An ord
 | id | BIGINT PK | |
 | user_id | BIGINT FK → users.id | |
 | hold_id | BIGINT FK → holds.id **UNIQUE** | a hold becomes at most one order |
-| status | TEXT | `pending_payment`, `paid`, `failed`, `refunded` |
+| status | TEXT | `pending_payment`, `paid`, `failed`, `refund_pending`, `refunded` |
 | total_cents | INT | |
 | idempotency_key | TEXT **UNIQUE** | prevents duplicate orders on retry |
 | payment_ref | TEXT | provider's payment id |
@@ -213,6 +214,25 @@ In words: a user has many orders and many holds. An event has many seats. An ord
 | seat_id | BIGINT FK → seats.id **UNIQUE** | **the final safety net: one ticket per seat, ever** |
 | user_id | BIGINT FK → users.id | |
 | issued_at | TIMESTAMPTZ | |
+
+### `payments` (added to handle slow and late confirmations)
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| id | BIGINT PK | |
+| order_id | BIGINT FK → orders.id | |
+| provider_payment_id | TEXT NOT NULL **UNIQUE** | the provider's id; lets a webhook find its payment and stops duplicates |
+| amount_cents | INT | |
+| status | TEXT | `pending`, `succeeded`, `failed`, `expired`, `needs_refund`, `refunded` |
+| deadline_at | TIMESTAMPTZ NOT NULL | the moment our seat reservation for this payment ends (also sent to the provider as its own expiry) |
+| created_at, updated_at | TIMESTAMPTZ | index on (status, deadline_at) for the reconciliation worker |
+
+### `webhook_events` (added so repeated webhooks are harmless)
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| provider_event_id | TEXT **PK** | providers resend webhooks; the primary key makes the second delivery a no-op |
+| received_at, processed_at | TIMESTAMPTZ | |
 
 ---
 
@@ -256,11 +276,79 @@ COMMIT;
 
 Either all of this happens or none of it (atomicity). Nobody else can change these seats in the middle because of the `FOR UPDATE` lock.
 
-We never keep a database transaction open while waiting for the payment provider, because a slow payment would hold locks and block everyone else. The **hold** is what reserves the seat during payment. When payment starts, the hold is extended slightly (for example, by 2 more minutes) so it does not expire mid-payment. If payment succeeds but the hold somehow expired and another user took the seat, the transaction in this layer fails and we automatically refund the user.
+We never keep a database transaction open while waiting for the payment provider, because a slow payment would hold locks and block everyone else. The **hold** is what reserves the seat during payment. What happens when the provider is slow or confirms late is specified in the next subsection.
 
-### Layer 3: Database constraint (the safety net)
+### Layer 4: Slow and late payments (hold expiry vs. webhook confirmation)
 
-`tickets.seat_id` is **UNIQUE**. Even if there were a bug in the application code, the database would physically refuse to insert a second ticket for the same seat, and the transaction would fail. Constraints are enforced by the database for every client, so they cannot be bypassed by a coding mistake.
+The dangerous case: the hold expires while the provider is still processing, another user takes the seat, and then a "payment succeeded" webhook arrives for a seat that is no longer ours. We close this gap in four steps.
+
+**Step A: Freeze the deadline when payment starts.** In `POST /orders/{id}/payment`, one transaction extends the reservation, but only if the hold is still valid:
+
+```sql
+UPDATE seats
+SET    hold_expires_at = now() + interval '10 minutes'          -- payment window
+WHERE  hold_id = :hold_id AND status = 'held' AND hold_expires_at > now();
+-- rows affected < number of seats  → hold already expired → return 410 Gone, create nothing
+INSERT INTO payments (order_id, provider_payment_id, status, deadline_at, ...)
+VALUES (:order_id, :provider_id, 'pending', now() + interval '10 minutes', ...);
+```
+
+The same deadline is sent to the provider as its own expiry, so the provider normally cannot approve a payment after we have given the seat away. The extension happens once, so a user cannot hold a seat forever. Because the seat-claim query from Layer 1 only takes seats that are `available` or have an *expired* `hold_expires_at`, nobody can take a seat during its payment window.
+
+**Step B: Make the webhook handler safe to repeat and safe when late.** The handler verifies the provider's signature, then runs:
+
+```text
+1. INSERT INTO webhook_events (provider_event_id) ...
+   ON CONFLICT DO NOTHING        → if nothing inserted, it's a duplicate: return 200.
+2. BEGIN;
+   SELECT * FROM payments WHERE provider_payment_id = :pid FOR UPDATE;   -- serialize with the worker
+   if payment.status already succeeded / refunded → COMMIT, return 200.
+3. if the event says "failed" → payment 'failed', order 'failed', release seats, COMMIT.
+4. if the event says "succeeded" → try to claim the seats, even if the deadline has passed:
+   UPDATE seats SET status = 'sold'
+   WHERE  id IN (:order_seat_ids)
+     AND ( (hold_id = :hold_id AND status = 'held')   -- still ours, even if the timestamp has passed
+        OR  status = 'available' );                   -- released by the sweeper, and nobody took it
+   -- rows affected = number of seats?
+   --   YES → INSERT tickets; orders 'paid'; payments 'succeeded'; holds 'converted'; COMMIT.
+   --   NO  → ROLLBACK that update, then in a new transaction:
+   --         payments 'needs_refund'; orders 'refund_pending'; COMMIT; enqueue a refund job.
+```
+
+So a late payment is treated fairly: if the seat is still free, the customer who paid gets it (no one was harmed). If another user got it in the meantime, the customer is refunded automatically and emailed, and `tickets.seat_id UNIQUE` guarantees that no second ticket can ever exist for that seat.
+
+**Step C: Reconciliation worker (webhooks can be lost or delayed).** A background worker runs every minute:
+
+```text
+- Find payments WHERE status = 'pending' AND deadline_at < now() - 2 minutes
+  → ask the provider for the real status (API call, outside any DB transaction),
+    then apply the same handler logic from Step B as if a webhook had arrived.
+  → if the provider says "expired/cancelled": payment 'expired', order 'failed', release seats.
+- Find payments WHERE status = 'needs_refund'
+  → call the provider's refund API with the idempotency key "refund-<payment id>",
+    set payment 'refunded' and order 'refunded' on success, retry with backoff on failure.
+- Alert (page a human) for any payment 'pending' for over 30 minutes or 'needs_refund' for over 1 hour.
+```
+
+**Step D: Make the expiry sweeper payment-aware.** It releases only seats whose hold has expired *and* whose payment (if any) is not `pending`:
+
+```sql
+UPDATE seats s SET status = 'available', hold_id = NULL, hold_expires_at = NULL
+WHERE  s.status = 'held' AND s.hold_expires_at < now()
+  AND NOT EXISTS (SELECT 1 FROM orders o JOIN payments p ON p.order_id = o.id
+                  WHERE o.hold_id = s.hold_id AND p.status = 'pending');
+```
+
+**Outcome table**
+
+| Situation | Result |
+| --- | --- |
+| Payment confirmed within the window | Ticket issued (normal path). |
+| Webhook delivered twice | Second delivery ignored (`webhook_events` primary key). |
+| Payment confirmed late, seat still free | Ticket issued, since the seat is still ours or unclaimed. |
+| Payment confirmed late, seat taken by someone else | Automatic refund and email; no double-booking. |
+| Webhook never arrives | Worker asks the provider and applies the same logic. |
+| Refund call fails | Retried with the same idempotency key; alert if stuck. |
 
 ### Supporting measures
 
@@ -323,6 +411,7 @@ We never keep a database transaction open while waiting for the payment provider
 | **PostgreSQL primary** | The single source of truth for seats, holds, orders and tickets. All writes and all seat-ownership decisions happen here, which is what makes the double-booking protection in section 5 work. |
 | **Read replicas** | Copies of the database used for browsing and search queries, so reads never compete with the hold and purchase transactions. |
 | **Message queue + workers** | Handle slow, non-urgent work off the main path: releasing expired holds, sending confirmation emails, and retrying failed jobs. The buyer does not wait for the email. |
+| **Payment reconciliation worker** | Runs every minute. Finds payments still `pending` past their deadline and asks the provider for the true status, applies the same safe finalize-or-refund logic as the webhook handler, and processes the refund queue. Without it, a lost webhook would leave a customer's money taken and no ticket issued (see section 5, Layer 4). |
 | **Payment provider** | External service that handles card details. It notifies us through a signed webhook, and we also accept the synchronous result. This keeps card data away from our servers. |
 
 ### How it survives the big sale
@@ -356,7 +445,13 @@ We never keep a database transaction open while waiting for the payment provider
 - **Benefit:** Protects the system and gives everyone an orderly, fair chance. It also discourages bots, since being fast stops mattering.
 - **Cost:** More complexity to build, and users may wait several minutes to even see the seat map, even if there would have been capacity for some of them. For normal events with low demand, the waiting room is switched off.
 
-### Trade-off 4: Hold duration (5 minutes)
+### Trade-off 4: Honoring late payments vs. strictly enforcing the deadline
+
+- **Choice:** If a payment confirms after the deadline but the seat is still free, we complete the sale. If the seat has been taken, we refund automatically.
+- **Benefit:** The customer who actually paid is not punished for the provider's slowness, and we lose fewer sales.
+- **Cost:** More code and more states (`needs_refund`, `refund_pending`) and a reconciliation worker to maintain, and some customers still get a refund instead of a ticket. A stricter rule ("expired means refund, always") would be simpler but would refund people for seats that nobody else wanted.
+
+### Trade-off 5: Hold duration (5 minutes, extended once for payment)
 
 - **Short holds** free seats quickly for other buyers, but a user on a slow payment may lose their seats.
 - **Long holds** give users comfort, but bots or indecisive users can lock up seats and make the event look sold out when it is not.
